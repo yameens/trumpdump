@@ -15,14 +15,8 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
-# Import DB helpers from the centralized db module
-import sys
-from pathlib import Path
-
-# Ensure the parent package is importable
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-
-from backend.app.db import (
+# Import DB helpers from the centralized db module (relative import)
+from ..db import (
     get_whitehouse_post_by_url,
     insert_whitehouse_post,
 )
@@ -209,7 +203,7 @@ def scrape_whitehouse_post(url: str) -> Optional[WhiteHousePost]:
 
 if __name__ == "__main__":
     # Quick test - run poll_whitehouse_once
-    from backend.app.db import init_db
+    from ..db import init_db
     
     init_db()
     result = poll_whitehouse_once()

@@ -4,35 +4,28 @@ import { useAnalysis } from '@/hooks/useAnalysis';
 import { AnalysisCard } from '@/components/AnalysisCard';
 
 export default function Home() {
-  const { analysis, loading, error, isLive, lastUpdated } = useAnalysis();
+  const { analysis, lastImpactful, loading, error, isLive, lastUpdated } = useAnalysis();
+
+  const currentHasNoTickers = analysis && (!analysis.tickers || analysis.tickers.length === 0);
 
   return (
     <main className="container">
-      {/* Title Section - GIF above Title */}
+      {/* Title Section - GIF positioned top-right overlapping title */}
       <div className="title-section">
-        <img
+      <img
           src="/ezgif.com-reverse.gif"
           alt=""
           className="trump-gif"
         />
         <img
-          src="/trumpdumpTITLE.png"
+          src="/trumptitleFIX.png"
           alt="TrumpDump"
           className="title-image"
         />
       </div>
 
       {/* Status Bar */}
-      <div className="status-bar">
-        <span className={`status-indicator ${isLive ? 'live' : 'polling'}`}>
-          {isLive ? '● LIVE' : '○ Polling'}
-        </span>
-        {lastUpdated && (
-          <span className="last-updated">
-            Last updated: {lastUpdated.toLocaleTimeString()}
-          </span>
-        )}
-      </div>
+     
 
       {/* Main Content */}
       <div className="content">
@@ -58,12 +51,23 @@ export default function Home() {
           </div>
         )}
 
+        {/* Current Analysis */}
         {analysis && <AnalysisCard analysis={analysis} />}
+
+        {/* Last Impactful Analysis */}
+        {currentHasNoTickers && lastImpactful && (
+          <div className="last-impactful-section">
+            <p className="last-impactful-intro">
+              Looking for actionable ticker insights? Here's the most recent analysis with specific market recommendations:
+            </p>
+            <AnalysisCard analysis={lastImpactful} isSecondary={true} />
+          </div>
+        )}
       </div>
 
       {/* Footer */}
       <footer className="footer">
-        <p>TrumpDump MVP - Real-time White House Market Analysis</p>
+        <p>TrumpDump, White House Market Analysis</p>
       </footer>
     </main>
   );

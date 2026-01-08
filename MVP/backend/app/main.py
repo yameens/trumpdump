@@ -2,31 +2,79 @@
 FastAPI server for TrumpDump MVP.
 
 Endpoints:
-- GET /latest - Returns the latest relevant analysis
-- GET /history - Returns recent analyses (relevant first)
+- GET /                    - Basic status
+- GET /health              - Detailed health check with DB and scheduler status
+- GET /latest              - Returns the latest relevant analysis
+- GET /latest-with-tickers - Returns most recent analysis with ticker impacts
+- GET /history             - Returns recent analyses (relevant first)
+- GET /stream              - Server-Sent Events for real-time updates
 
-Run with: uvicorn backend.app.main:app --reload
+Run from the MVP/ directory:
+    cd MVP
+    pip install -r backend/requirements.txt
+    uvicorn backend.app.main:app --reload --port 8000
+
+The server will start at http://localhost:8000
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from .db import (
     get_latest_relevant_analysis,
     get_latest_analysis,
+    get_latest_analysis_with_tickers,
     get_whitehouse_post_by_id,
     init_db,
     get_connection,
+    check_db_connection,
     DEFAULT_MIN_RELEVANCE_SCORE,
     DEFAULT_MIN_TOP_VERTICAL_CONF,
+    USE_POSTGRES,
 )
+
+# ---------------------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration from Environment
+# ---------------------------------------------------------------------------
+
+# CORS origins (comma-separated list)
+DEFAULT_ORIGINS = "http://localhost:3000,http://localhost:5173,http://localhost:5174,http://127.0.0.1:3000"
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", DEFAULT_ORIGINS).split(",")
+
+# Admin API key for protected endpoints
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+# App version
+APP_VERSION = "0.2.0"
+
+# ---------------------------------------------------------------------------
+# Rate Limiting
+# ---------------------------------------------------------------------------
+
+limiter = Limiter(key_func=get_remote_address)
 
 # ---------------------------------------------------------------------------
 # App initialization
@@ -35,20 +83,29 @@ from .db import (
 app = FastAPI(
     title="TrumpDump API",
     description="Market impact analysis of White House announcements",
-    version="0.1.0",
+    version=APP_VERSION,
 )
 
-# CORS for localhost frontend development
+# Add rate limiting middleware
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+# Handle rate limit exceeded errors
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return HTTPException(
+        status_code=429,
+        detail={
+            "message": "Rate limit exceeded",
+            "retry_after": str(exc.detail),
+        }
+    )
+
+# CORS middleware with configurable origins
+logger.info(f"Configuring CORS for origins: {ALLOWED_ORIGINS}")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -59,21 +116,44 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     """Run database migrations and start scheduler on startup."""
-    import os
+    logger.info("Starting TrumpDump API...")
+    logger.info(f"Database mode: {'PostgreSQL' if USE_POSTGRES else 'SQLite'}")
     
     init_db()
+    logger.info("Database initialized")
     
     # Start scheduler unless disabled
     if os.getenv("DISABLE_SCHEDULER", "false").lower() != "true":
         from .services.scheduler import start_scheduler
         start_scheduler(app)
+    else:
+        logger.info("Scheduler disabled via DISABLE_SCHEDULER env var")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Stop scheduler on shutdown."""
+    logger.info("Shutting down TrumpDump API...")
     from .services.scheduler import stop_scheduler
     stop_scheduler()
+
+
+# ---------------------------------------------------------------------------
+# Admin Authentication
+# ---------------------------------------------------------------------------
+
+async def verify_admin_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    """
+    Verify admin API key for protected endpoints.
+    
+    If ADMIN_API_KEY is not set, admin endpoints are open (for local dev).
+    If set, requests must include X-API-Key header with matching value.
+    """
+    if ADMIN_API_KEY and x_api_key != ADMIN_API_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail={"message": "Invalid or missing API key"}
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +188,8 @@ class PostInfo(BaseModel):
     id: int
     url: str
     title: Optional[str] = None
+    content_preview: Optional[str] = None  # First 500 chars for preview
+    content: Optional[str] = None          # Full original post content
 
 
 class LatestAnalysis(BaseModel):
@@ -154,7 +236,16 @@ class HistoryResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """Health check response."""
+    """Detailed health check response."""
+    status: str
+    version: str
+    database: str
+    database_connected: bool
+    scheduler_running: bool
+
+
+class BasicStatus(BaseModel):
+    """Basic status response."""
     status: str
     version: str
 
@@ -218,14 +309,18 @@ def parse_analysis_row(row: Dict[str, Any]) -> LatestAnalysis:
         except (json.JSONDecodeError, TypeError):
             pass
     
-    # Get linked post info
+    # Get linked post info with content
     post_info = None
     post = get_whitehouse_post_by_id(row["post_id"])
     if post:
+        content = post.get("content", "")
+        content_preview = content[:500] + "..." if len(content) > 500 else content
         post_info = PostInfo(
             id=post["id"],
             url=post["url"],
             title=post.get("title"),
+            content_preview=content_preview if content else None,
+            content=content if content else None,
         )
     
     return LatestAnalysis(
@@ -249,40 +344,44 @@ def get_recent_analyses(
     relevant_first: bool = True,
 ) -> List[Dict[str, Any]]:
     """Get recent analyses, optionally sorted with relevant first."""
+    from .db import _get_placeholder, USE_POSTGRES
+    
     conn = get_connection()
     cur = conn.cursor()
+    ph = _get_placeholder()
     
     if relevant_first:
         # Sort by relevance (relevant first), then by recency
         cur.execute(
-            """
+            f"""
             SELECT id, post_id, created_at_utc, relevance_score,
                    top_vertical, top_vertical_conf
             FROM analyses
             ORDER BY 
                 CASE 
-                    WHEN relevance_score >= ? AND top_vertical_conf >= ? THEN 0 
+                    WHEN relevance_score >= {ph} AND top_vertical_conf >= {ph} THEN 0 
                     ELSE 1 
                 END,
                 created_at_utc DESC,
                 id DESC
-            LIMIT ?
+            LIMIT {ph}
             """,
             (DEFAULT_MIN_RELEVANCE_SCORE, DEFAULT_MIN_TOP_VERTICAL_CONF, limit),
         )
     else:
         cur.execute(
-            """
+            f"""
             SELECT id, post_id, created_at_utc, relevance_score,
                    top_vertical, top_vertical_conf
             FROM analyses
             ORDER BY created_at_utc DESC, id DESC
-            LIMIT ?
+            LIMIT {ph}
             """,
             (limit,),
         )
     
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     
     return [dict(row) for row in rows]
@@ -294,22 +393,54 @@ def count_analyses() -> int:
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) as count FROM analyses")
     row = cur.fetchone()
+    cur.close()
     conn.close()
     return row["count"] if row else 0
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Health & Status Endpoints
 # ---------------------------------------------------------------------------
 
-@app.get("/", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint."""
-    return HealthResponse(status="ok", version="0.1.0")
+@app.get("/", response_model=BasicStatus)
+async def root():
+    """Basic status endpoint - always returns OK if server is running."""
+    return BasicStatus(status="ok", version=APP_VERSION)
 
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """
+    Detailed health check endpoint.
+    
+    Returns database connection status and scheduler status.
+    Use this for monitoring and load balancer health checks.
+    """
+    from .services.scheduler import is_scheduler_running
+    
+    db_connected = check_db_connection()
+    scheduler_running = is_scheduler_running()
+    
+    # Determine overall status
+    status = "ok" if db_connected else "degraded"
+    
+    return HealthResponse(
+        status=status,
+        version=APP_VERSION,
+        database="postgresql" if USE_POSTGRES else "sqlite",
+        database_connected=db_connected,
+        scheduler_running=scheduler_running,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API Endpoints (with rate limiting)
+# ---------------------------------------------------------------------------
 
 @app.get("/latest", response_model=LatestAnalysis)
+@limiter.limit("60/minute")
 async def get_latest(
+    request: Request,
     min_score: Optional[int] = Query(
         None,
         ge=0,
@@ -350,8 +481,33 @@ async def get_latest(
     return parse_analysis_row(row)
 
 
+@app.get("/latest-with-tickers", response_model=LatestAnalysis)
+@limiter.limit("60/minute")
+async def get_latest_with_tickers(request: Request):
+    """
+    Get the most recent analysis that has ticker impacts.
+    
+    Use this to show "last impactful" analysis when the current
+    latest analysis has no specific ticker recommendations.
+    """
+    row = get_latest_analysis_with_tickers()
+    
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "No analysis with ticker impacts found",
+                "hint": "No analyses have been recorded with specific ticker recommendations yet",
+            }
+        )
+    
+    return parse_analysis_row(row)
+
+
 @app.get("/history", response_model=HistoryResponse)
+@limiter.limit("30/minute")
 async def get_history(
+    request: Request,
     limit: int = Query(
         20,
         ge=1,
@@ -405,7 +561,8 @@ async def get_history(
 
 
 @app.get("/analysis/{analysis_id}", response_model=LatestAnalysis)
-async def get_analysis_detail(analysis_id: int):
+@limiter.limit("60/minute")
+async def get_analysis_detail(request: Request, analysis_id: int):
     """Get a specific analysis by ID."""
     from .db import get_analysis_by_id
     
@@ -418,38 +575,6 @@ async def get_analysis_detail(analysis_id: int):
         )
     
     return parse_analysis_row(row)
-
-
-# ---------------------------------------------------------------------------
-# Admin/Scheduler endpoints
-# ---------------------------------------------------------------------------
-
-class SchedulerStatus(BaseModel):
-    """Scheduler status response."""
-    running: bool
-    poll_interval_seconds: int
-    skip_analysis: bool
-
-
-@app.get("/admin/scheduler/status", response_model=SchedulerStatus)
-async def get_scheduler_status():
-    """Get the current scheduler status."""
-    from .services.scheduler import is_scheduler_running, POLL_INTERVAL, SKIP_ANALYSIS
-    
-    return SchedulerStatus(
-        running=is_scheduler_running(),
-        poll_interval_seconds=POLL_INTERVAL,
-        skip_analysis=SKIP_ANALYSIS,
-    )
-
-
-@app.post("/admin/scheduler/poll")
-async def trigger_poll():
-    """Manually trigger a poll (for testing/admin)."""
-    from .services.scheduler import trigger_poll_now
-    
-    await trigger_poll_now()
-    return {"message": "Poll triggered", "status": "ok"}
 
 
 # ---------------------------------------------------------------------------
@@ -491,9 +616,41 @@ async def stream_analyses():
     )
 
 
-@app.get("/admin/sse/status")
+# ---------------------------------------------------------------------------
+# Admin/Scheduler endpoints (protected)
+# ---------------------------------------------------------------------------
+
+class SchedulerStatus(BaseModel):
+    """Scheduler status response."""
+    running: bool
+    poll_interval_seconds: int
+    skip_analysis: bool
+
+
+@app.get("/admin/scheduler/status", response_model=SchedulerStatus, dependencies=[Depends(verify_admin_key)])
+async def get_scheduler_status():
+    """Get the current scheduler status. Requires admin API key if configured."""
+    from .services.scheduler import is_scheduler_running, POLL_INTERVAL, SKIP_ANALYSIS
+    
+    return SchedulerStatus(
+        running=is_scheduler_running(),
+        poll_interval_seconds=POLL_INTERVAL,
+        skip_analysis=SKIP_ANALYSIS,
+    )
+
+
+@app.post("/admin/scheduler/poll", dependencies=[Depends(verify_admin_key)])
+async def trigger_poll():
+    """Manually trigger a poll. Requires admin API key if configured."""
+    from .services.scheduler import trigger_poll_now
+    
+    await trigger_poll_now()
+    return {"message": "Poll triggered", "status": "ok"}
+
+
+@app.get("/admin/sse/status", dependencies=[Depends(verify_admin_key)])
 async def get_sse_status():
-    """Get the current SSE subscriber count."""
+    """Get the current SSE subscriber count. Requires admin API key if configured."""
     from .services.events import get_subscriber_count
     
     return {
@@ -501,9 +658,9 @@ async def get_sse_status():
     }
 
 
-@app.post("/admin/sse/test")
+@app.post("/admin/sse/test", dependencies=[Depends(verify_admin_key)])
 async def publish_test_event():
-    """Publish a test event to all SSE subscribers (for testing)."""
+    """Publish a test event to all SSE subscribers. Requires admin API key if configured."""
     from .services.events import publish_analysis, get_subscriber_count
     
     subscriber_count = get_subscriber_count()
@@ -541,4 +698,3 @@ async def publish_test_event():
         "status": "published",
         "message": f"Test event sent to {subscriber_count} subscriber(s)",
     }
-

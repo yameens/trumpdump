@@ -1,31 +1,99 @@
 """
 Database module for TrumpDump MVP.
 
-Handles SQLite connections, migrations, and provides helper functions
-for whitehouse_posts and analyses tables.
+Supports both PostgreSQL (production) and SQLite (local development).
+Uses DATABASE_URL environment variable to determine which to use.
+
+If DATABASE_URL starts with "postgres://" or "postgresql://", uses PostgreSQL.
+Otherwise, uses SQLite with the provided path or default location.
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
+import logging
+import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-# Default database path (relative to project root)
-DEFAULT_DB_PATH = Path(__file__).parent.parent.parent / "trumpdump.db"
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Database Configuration
+# ---------------------------------------------------------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# Check if we should use PostgreSQL
+USE_POSTGRES = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+
+# Default SQLite path for local development
+DEFAULT_SQLITE_PATH = Path(__file__).parent.parent.parent / "trumpdump.db"
+
+if USE_POSTGRES:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    logger.info("Using PostgreSQL database")
+else:
+    import sqlite3
+    logger.info(f"Using SQLite database at {DEFAULT_SQLITE_PATH}")
 
 
-def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
+# ---------------------------------------------------------------------------
+# Connection Management
+# ---------------------------------------------------------------------------
+
+def get_connection(db_path: Optional[str] = None) -> Any:
     """
-    Open a SQLite connection with row factory for dict-like access.
+    Get a database connection.
+    
+    For PostgreSQL: Uses DATABASE_URL environment variable.
+    For SQLite: Uses db_path or DEFAULT_SQLITE_PATH.
+    
+    Returns a connection object with dict-like row access.
     """
-    path = db_path or str(DEFAULT_DB_PATH)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row  # enables dict-like row access
-    return conn
+    if USE_POSTGRES:
+        # PostgreSQL connection
+        # Handle Railway's postgres:// vs postgresql://
+        url = DATABASE_URL
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql://", 1)
+        conn = psycopg2.connect(url, cursor_factory=RealDictCursor)
+        return conn
+    else:
+        # SQLite connection
+        path = db_path or str(DEFAULT_SQLITE_PATH)
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row  # enables dict-like row access
+        return conn
 
+
+def _row_to_dict(row: Any) -> Optional[Dict[str, Any]]:
+    """Convert a database row to a plain dict, or None if row is None."""
+    if row is None:
+        return None
+    if USE_POSTGRES:
+        # RealDictRow is already dict-like
+        return dict(row)
+    else:
+        # sqlite3.Row needs conversion
+        return dict(row)
+
+
+def _get_placeholder() -> str:
+    """Get the parameter placeholder for the current database."""
+    return "%s" if USE_POSTGRES else "?"
+
+
+def _get_returning_id() -> str:
+    """Get the RETURNING clause for the current database."""
+    return " RETURNING id" if USE_POSTGRES else ""
+
+
+# ---------------------------------------------------------------------------
+# Migrations
+# ---------------------------------------------------------------------------
 
 def run_migrations(db_path: Optional[str] = None) -> None:
     """
@@ -34,57 +102,114 @@ def run_migrations(db_path: Optional[str] = None) -> None:
     conn = get_connection(db_path)
     cur = conn.cursor()
 
-    # whitehouse_posts table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS whitehouse_posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE NOT NULL,
-            title TEXT,
-            content TEXT,
-            scraped_at_utc INTEGER NOT NULL
-        );
-    """)
+    if USE_POSTGRES:
+        # PostgreSQL schema
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS whitehouse_posts (
+                id SERIAL PRIMARY KEY,
+                url TEXT UNIQUE NOT NULL,
+                title TEXT,
+                content TEXT,
+                scraped_at_utc BIGINT NOT NULL
+            );
+        """)
 
-    # analyses table with foreign key to whitehouse_posts
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS analyses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            post_id INTEGER NOT NULL,
-            created_at_utc INTEGER NOT NULL,
-            relevance_score INTEGER,
-            market_json TEXT,
-            tickers_json TEXT,
-            top_vertical TEXT,
-            top_vertical_conf REAL,
-            FOREIGN KEY (post_id) REFERENCES whitehouse_posts(id)
-        );
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS analyses (
+                id SERIAL PRIMARY KEY,
+                post_id INTEGER NOT NULL REFERENCES whitehouse_posts(id),
+                created_at_utc BIGINT NOT NULL,
+                relevance_score INTEGER,
+                market_json TEXT,
+                tickers_json TEXT,
+                top_vertical TEXT,
+                top_vertical_conf REAL
+            );
+        """)
 
-    # Create indexes for common queries
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_whitehouse_posts_scraped_at
-        ON whitehouse_posts(scraped_at_utc DESC);
-    """)
+        # Create indexes
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_whitehouse_posts_scraped_at
+            ON whitehouse_posts(scraped_at_utc DESC);
+        """)
 
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_analyses_created_at
-        ON analyses(created_at_utc DESC);
-    """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_analyses_created_at
+            ON analyses(created_at_utc DESC);
+        """)
 
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_analyses_relevance
-        ON analyses(relevance_score DESC, top_vertical_conf DESC);
-    """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_analyses_relevance
+            ON analyses(relevance_score DESC, top_vertical_conf DESC);
+        """)
+    else:
+        # SQLite schema
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS whitehouse_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT UNIQUE NOT NULL,
+                title TEXT,
+                content TEXT,
+                scraped_at_utc INTEGER NOT NULL
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id INTEGER NOT NULL,
+                created_at_utc INTEGER NOT NULL,
+                relevance_score INTEGER,
+                market_json TEXT,
+                tickers_json TEXT,
+                top_vertical TEXT,
+                top_vertical_conf REAL,
+                FOREIGN KEY (post_id) REFERENCES whitehouse_posts(id)
+            );
+        """)
+
+        # Create indexes
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_whitehouse_posts_scraped_at
+            ON whitehouse_posts(scraped_at_utc DESC);
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_analyses_created_at
+            ON analyses(created_at_utc DESC);
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_analyses_relevance
+            ON analyses(relevance_score DESC, top_vertical_conf DESC);
+        """)
 
     conn.commit()
+    cur.close()
     conn.close()
+    logger.info("Database migrations completed successfully")
 
 
-def _row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
-    """Convert a sqlite3.Row to a plain dict, or None if row is None."""
-    if row is None:
-        return None
-    return dict(row)
+# ---------------------------------------------------------------------------
+# Health Check
+# ---------------------------------------------------------------------------
+
+def check_db_connection() -> bool:
+    """
+    Check if the database connection is working.
+    Returns True if connected, False otherwise.
+    """
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Database connection check failed: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -108,23 +233,48 @@ def insert_whitehouse_post(
 
     conn = get_connection(db_path)
     cur = conn.cursor()
+    ph = _get_placeholder()
 
     try:
-        cur.execute(
-            """
-            INSERT INTO whitehouse_posts (url, title, content, scraped_at_utc)
-            VALUES (?, ?, ?, ?)
-            """,
-            (url, title, content, scraped_at_utc),
-        )
-        row_id = cur.lastrowid
+        if USE_POSTGRES:
+            # PostgreSQL with ON CONFLICT
+            cur.execute(
+                f"""
+                INSERT INTO whitehouse_posts (url, title, content, scraped_at_utc)
+                VALUES ({ph}, {ph}, {ph}, {ph})
+                ON CONFLICT (url) DO NOTHING
+                RETURNING id
+                """,
+                (url, title, content, scraped_at_utc),
+            )
+            result = cur.fetchone()
+            if result:
+                row_id = result["id"]
+            else:
+                # URL already exists, fetch existing id
+                cur.execute(f"SELECT id FROM whitehouse_posts WHERE url = {ph}", (url,))
+                row = cur.fetchone()
+                row_id = row["id"] if row else -1
+        else:
+            # SQLite
+            try:
+                cur.execute(
+                    f"""
+                    INSERT INTO whitehouse_posts (url, title, content, scraped_at_utc)
+                    VALUES ({ph}, {ph}, {ph}, {ph})
+                    """,
+                    (url, title, content, scraped_at_utc),
+                )
+                row_id = cur.lastrowid
+            except sqlite3.IntegrityError:
+                # URL already exists, fetch existing id
+                cur.execute(f"SELECT id FROM whitehouse_posts WHERE url = {ph}", (url,))
+                row = cur.fetchone()
+                row_id = row["id"] if row else -1
+        
         conn.commit()
-    except sqlite3.IntegrityError:
-        # URL already exists, fetch existing id
-        cur.execute("SELECT id FROM whitehouse_posts WHERE url = ?", (url,))
-        row = cur.fetchone()
-        row_id = row["id"] if row else -1
     finally:
+        cur.close()
         conn.close()
 
     return row_id
@@ -145,6 +295,7 @@ def get_latest_whitehouse_post(db_path: Optional[str] = None) -> Optional[Dict[s
         LIMIT 1
     """)
     row = cur.fetchone()
+    cur.close()
     conn.close()
 
     return _row_to_dict(row)
@@ -159,16 +310,18 @@ def get_whitehouse_post_by_id(
     """
     conn = get_connection(db_path)
     cur = conn.cursor()
+    ph = _get_placeholder()
 
     cur.execute(
-        """
+        f"""
         SELECT id, url, title, content, scraped_at_utc
         FROM whitehouse_posts
-        WHERE id = ?
+        WHERE id = {ph}
         """,
         (post_id,),
     )
     row = cur.fetchone()
+    cur.close()
     conn.close()
 
     return _row_to_dict(row)
@@ -183,16 +336,18 @@ def get_whitehouse_post_by_url(
     """
     conn = get_connection(db_path)
     cur = conn.cursor()
+    ph = _get_placeholder()
 
     cur.execute(
-        """
+        f"""
         SELECT id, url, title, content, scraped_at_utc
         FROM whitehouse_posts
-        WHERE url = ?
+        WHERE url = {ph}
         """,
         (url,),
     )
     row = cur.fetchone()
+    cur.close()
     conn.close()
 
     return _row_to_dict(row)
@@ -225,27 +380,52 @@ def insert_analysis(
 
     conn = get_connection(db_path)
     cur = conn.cursor()
+    ph = _get_placeholder()
 
-    cur.execute(
-        """
-        INSERT INTO analyses (
-            post_id, created_at_utc, relevance_score,
-            market_json, tickers_json, top_vertical, top_vertical_conf
+    if USE_POSTGRES:
+        cur.execute(
+            f"""
+            INSERT INTO analyses (
+                post_id, created_at_utc, relevance_score,
+                market_json, tickers_json, top_vertical, top_vertical_conf
+            )
+            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+            RETURNING id
+            """,
+            (
+                post_id,
+                created_at_utc,
+                relevance_score,
+                market_json,
+                tickers_json,
+                top_vertical,
+                top_vertical_conf,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            post_id,
-            created_at_utc,
-            relevance_score,
-            market_json,
-            tickers_json,
-            top_vertical,
-            top_vertical_conf,
-        ),
-    )
-    row_id = cur.lastrowid
+        row_id = cur.fetchone()["id"]
+    else:
+        cur.execute(
+            f"""
+            INSERT INTO analyses (
+                post_id, created_at_utc, relevance_score,
+                market_json, tickers_json, top_vertical, top_vertical_conf
+            )
+            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+            """,
+            (
+                post_id,
+                created_at_utc,
+                relevance_score,
+                market_json,
+                tickers_json,
+                top_vertical,
+                top_vertical_conf,
+            ),
+        )
+        row_id = cur.lastrowid
+
     conn.commit()
+    cur.close()
     conn.close()
 
     return row_id
@@ -339,22 +519,24 @@ def get_latest_relevant_analysis(
     
     conn = get_connection(db_path)
     cur = conn.cursor()
+    ph = _get_placeholder()
 
     cur.execute(
-        """
+        f"""
         SELECT id, post_id, created_at_utc, relevance_score,
                market_json, tickers_json, top_vertical, top_vertical_conf
         FROM analyses
         WHERE relevance_score IS NOT NULL 
-          AND relevance_score >= ?
+          AND relevance_score >= {ph}
           AND top_vertical_conf IS NOT NULL
-          AND top_vertical_conf >= ?
+          AND top_vertical_conf >= {ph}
         ORDER BY created_at_utc DESC, id DESC
         LIMIT 1
         """,
         (min_score, min_conf),
     )
     row = cur.fetchone()
+    cur.close()
     conn.close()
 
     return _row_to_dict(row)
@@ -382,6 +564,39 @@ def get_latest_analysis(
         """,
     )
     row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    return _row_to_dict(row)
+
+
+def get_latest_analysis_with_tickers(
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Get the most recent analysis that has ticker impacts.
+    
+    Returns the latest analysis where tickers_json is not null/empty.
+    Useful for showing "last impactful" analysis when current has no tickers.
+    """
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT id, post_id, created_at_utc, relevance_score,
+               market_json, tickers_json, top_vertical, top_vertical_conf
+        FROM analyses
+        WHERE tickers_json IS NOT NULL 
+          AND tickers_json != '[]'
+          AND tickers_json != 'null'
+          AND length(tickers_json) > 2
+        ORDER BY created_at_utc DESC, id DESC
+        LIMIT 1
+        """,
+    )
+    row = cur.fetchone()
+    cur.close()
     conn.close()
 
     return _row_to_dict(row)
@@ -396,17 +611,19 @@ def get_analysis_by_id(
     """
     conn = get_connection(db_path)
     cur = conn.cursor()
+    ph = _get_placeholder()
 
     cur.execute(
-        """
+        f"""
         SELECT id, post_id, created_at_utc, relevance_score,
                market_json, tickers_json, top_vertical, top_vertical_conf
         FROM analyses
-        WHERE id = ?
+        WHERE id = {ph}
         """,
         (analysis_id,),
     )
     row = cur.fetchone()
+    cur.close()
     conn.close()
 
     return _row_to_dict(row)
@@ -421,18 +638,20 @@ def get_analyses_for_post(
     """
     conn = get_connection(db_path)
     cur = conn.cursor()
+    ph = _get_placeholder()
 
     cur.execute(
-        """
+        f"""
         SELECT id, post_id, created_at_utc, relevance_score,
                market_json, tickers_json, top_vertical, top_vertical_conf
         FROM analyses
-        WHERE post_id = ?
+        WHERE post_id = {ph}
         ORDER BY created_at_utc DESC
         """,
         (post_id,),
     )
     rows = cur.fetchall()
+    cur.close()
     conn.close()
 
     return [dict(row) for row in rows]
@@ -442,17 +661,18 @@ def get_analyses_for_post(
 # Initialization
 # ---------------------------------------------------------------------------
 
+_initialized = False
+
 def init_db(db_path: Optional[str] = None) -> None:
     """
     Initialize the database: run migrations to ensure tables exist.
     Call this on application startup.
     """
-    run_migrations(db_path)
+    global _initialized
+    if not _initialized:
+        run_migrations(db_path)
+        _initialized = True
 
 
-# Run migrations on module import for convenience
-# (can be disabled by importing specific functions only)
-if __name__ != "__main__":
-    # Auto-migrate when imported as a module
-    run_migrations()
-
+# Don't auto-run migrations on import in production
+# Let the app explicitly call init_db()

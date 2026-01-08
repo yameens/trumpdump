@@ -62,7 +62,7 @@ def _get_facts_model() -> str:
 
 
 def _get_market_model() -> str:
-    return os.getenv("MARKET_MODEL", os.getenv("market_model", "gpt-4o"))
+    return os.getenv("MARKET_MODEL", os.getenv("market_model", "o3-mini"))
 
 
 # ---------------------------------------------------------------------------

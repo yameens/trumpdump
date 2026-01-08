@@ -7,6 +7,8 @@ export interface PostInfo {
   id: number;
   url: string;
   title?: string;
+  content_preview?: string;  // First 500 chars for preview
+  content?: string;          // Full original post content
 }
 
 export interface MoveEstimate {
@@ -72,4 +74,5 @@ export interface APIError {
     };
   };
 }
+
 

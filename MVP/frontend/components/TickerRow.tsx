@@ -82,3 +82,4 @@ export function TickerRow({ ticker }: TickerRowProps) {
   );
 }
 
+

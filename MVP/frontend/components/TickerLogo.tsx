@@ -65,3 +65,4 @@ export function TickerLogo({ ticker, size = 32 }: TickerLogoProps) {
   );
 }
 
+

@@ -7,6 +7,7 @@ Uses the centralized DB layer for storage - no direct DB logic here.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -28,6 +29,9 @@ from ..db import (
 
 LISTING_URL = "https://www.whitehouse.gov/briefings-statements/"
 USER_AGENT = "TrumpDumpBot/0.1 (contact: you@example.com)"
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 ARTICLE_URL_RE = re.compile(
     r"^/briefings-statements/\d{4}/\d{2}/[^\"'\s]+/?$"
@@ -120,13 +124,13 @@ def poll_whitehouse_once(db_path: Optional[str] = None) -> Optional[WhiteHousePo
     try:
         listing_html = _fetch_html(LISTING_URL)
     except requests.RequestException as e:
-        print(f"Error fetching listing page: {e}")
+        logger.error(f"Error fetching White House listing page: {e}")
         return None
 
     # Step 2: Extract the latest article link
     latest = _extract_latest_listing_link(listing_html)
     if latest is None:
-        print("Could not find a latest post link.")
+        logger.debug("Could not find a latest White House post link.")
         return None
 
     url, title = latest
@@ -134,14 +138,14 @@ def poll_whitehouse_once(db_path: Optional[str] = None) -> Optional[WhiteHousePo
     # Step 3: Check if we've already seen this post (using DB helpers)
     existing = get_whitehouse_post_by_url(url, db_path=db_path)
     if existing is not None:
-        print("No new White House post.")
+        logger.debug("No new White House post.")
         return None
 
     # Step 4: Fetch and extract the article content
     try:
         article_html = _fetch_html(url)
     except requests.RequestException as e:
-        print(f"Error fetching article: {e}")
+        logger.error(f"Error fetching White House article: {e}")
         return None
 
     content = _extract_article_content(article_html)
@@ -156,9 +160,8 @@ def poll_whitehouse_once(db_path: Optional[str] = None) -> Optional[WhiteHousePo
         db_path=db_path,
     )
 
-    print("NEW post saved:")
-    print(f"  Title: {title}")
-    print(f"  URL: {url}")
+    logger.info(f"NEW White House post saved: {url}")
+    logger.info(f"  Title: {title}")
 
     # Step 6: Return the dataclass
     return WhiteHousePost(
@@ -179,7 +182,7 @@ def scrape_whitehouse_post(url: str) -> Optional[WhiteHousePost]:
     try:
         article_html = _fetch_html(url)
     except requests.RequestException as e:
-        print(f"Error fetching article: {e}")
+        logger.error(f"Error fetching White House article: {e}")
         return None
 
     content = _extract_article_content(article_html)

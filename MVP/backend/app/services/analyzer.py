@@ -472,15 +472,15 @@ def market_impact(facts_json: Dict[str, Any]) -> Dict[str, Any]:
     return market_json
 
 
-def analyze_whitehouse_post(
+def analyze_post(
     post: Union[Dict[str, Any], Any],
 ) -> Dict[str, Any]:
     """
-    Convenience function: analyze a White House post end-to-end.
+    Generic function: analyze any post end-to-end.
     
     Args:
-        post: Either a dict with {url, title, content, scraped_at_utc}
-              or a WhiteHousePost dataclass
+        post: Either a dict with {url, title, content, source}
+              or a dataclass with these attributes (WhiteHousePost, TruthSocialPost, UnifiedPost)
     
     Returns:
         market_json dict matching MARKET_SCHEMA
@@ -494,11 +494,19 @@ def analyze_whitehouse_post(
         url = post.get("url", "unknown")
         title = post.get("title", "")
         content = post.get("content", "")
+        source = post.get("source", "Unknown")
     else:
         # Assume dataclass with attributes
         url = getattr(post, "url", "unknown")
-        title = getattr(post, "title", "")
+        title = getattr(post, "title", "") or ""
         content = getattr(post, "content", "")
+        source = getattr(post, "source", "Unknown")
+
+    # Map source to display name
+    source_display = {
+        "whitehouse": "White House",
+        "truthsocial": "Truth Social (Trump)",
+    }.get(source.lower(), source)
 
     # Build full text from title + content
     text_parts = []
@@ -514,18 +522,53 @@ def analyze_whitehouse_post(
 
     # Create metadata
     meta = PostMeta(
-        source="White House",
+        source=source_display,
         url=url,
     )
 
     # Step 1: Extract facts
-    logger.info(f"Analyzing White House post: {url}")
+    logger.info(f"Analyzing {source_display} post: {url}")
     facts_json = extract_facts(full_text, meta)
 
     # Step 2: Generate market impact
     market_json = market_impact(facts_json)
 
     return market_json
+
+
+def analyze_whitehouse_post(
+    post: Union[Dict[str, Any], Any],
+) -> Dict[str, Any]:
+    """
+    Convenience function: analyze a White House post end-to-end.
+    
+    DEPRECATED: Use analyze_post() instead for unified handling.
+    
+    Args:
+        post: Either a dict with {url, title, content, scraped_at_utc}
+              or a WhiteHousePost dataclass
+    
+    Returns:
+        market_json dict matching MARKET_SCHEMA
+    
+    Raises:
+        ValueError: If post content is empty
+        RuntimeError: On API errors
+    """
+    # Add source if not present
+    if isinstance(post, dict):
+        if "source" not in post:
+            post["source"] = "whitehouse"
+    elif not hasattr(post, "source"):
+        # Create a dict version with source
+        post = {
+            "url": getattr(post, "url", "unknown"),
+            "title": getattr(post, "title", ""),
+            "content": getattr(post, "content", ""),
+            "source": "whitehouse",
+        }
+    
+    return analyze_post(post)
 
 
 # ---------------------------------------------------------------------------

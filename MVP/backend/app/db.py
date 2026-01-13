@@ -6,6 +6,11 @@ Uses DATABASE_URL environment variable to determine which to use.
 
 If DATABASE_URL starts with "postgres://" or "postgresql://", uses PostgreSQL.
 Otherwise, uses SQLite with the provided path or default location.
+
+Tables:
+- posts: Unified table for all scraped posts (whitehouse, truthsocial, etc.)
+- analyses: Analysis results linked to posts
+- whitehouse_posts: Legacy table (kept for backward compatibility)
 """
 
 from __future__ import annotations
@@ -38,6 +43,14 @@ if USE_POSTGRES:
 else:
     import sqlite3
     logger.info(f"Using SQLite database at {DEFAULT_SQLITE_PATH}")
+
+
+# ---------------------------------------------------------------------------
+# Constants for sources
+# ---------------------------------------------------------------------------
+
+SOURCE_WHITEHOUSE = "whitehouse"
+SOURCE_TRUTHSOCIAL = "truthsocial"
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +117,8 @@ def run_migrations(db_path: Optional[str] = None) -> None:
 
     if USE_POSTGRES:
         # PostgreSQL schema
+        
+        # Legacy whitehouse_posts table (for backward compatibility)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS whitehouse_posts (
                 id SERIAL PRIMARY KEY,
@@ -113,11 +128,24 @@ def run_migrations(db_path: Optional[str] = None) -> None:
                 scraped_at_utc BIGINT NOT NULL
             );
         """)
+        
+        # NEW: Unified posts table for all sources
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id SERIAL PRIMARY KEY,
+                source TEXT NOT NULL,
+                url TEXT UNIQUE NOT NULL,
+                title TEXT,
+                content TEXT,
+                scraped_at_utc BIGINT NOT NULL,
+                is_retruth BOOLEAN DEFAULT FALSE
+            );
+        """)
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS analyses (
                 id SERIAL PRIMARY KEY,
-                post_id INTEGER NOT NULL REFERENCES whitehouse_posts(id),
+                post_id INTEGER NOT NULL,
                 created_at_utc BIGINT NOT NULL,
                 relevance_score INTEGER,
                 market_json TEXT,
@@ -132,6 +160,16 @@ def run_migrations(db_path: Optional[str] = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_whitehouse_posts_scraped_at
             ON whitehouse_posts(scraped_at_utc DESC);
         """)
+        
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_posts_scraped_at
+            ON posts(scraped_at_utc DESC);
+        """)
+        
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_posts_source
+            ON posts(source);
+        """)
 
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_analyses_created_at
@@ -142,8 +180,22 @@ def run_migrations(db_path: Optional[str] = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_analyses_relevance
             ON analyses(relevance_score DESC, top_vertical_conf DESC);
         """)
+        
+        # Migrate data from whitehouse_posts to posts if not already done
+        cur.execute("""
+            INSERT INTO posts (source, url, title, content, scraped_at_utc, is_retruth)
+            SELECT 'whitehouse', url, title, content, scraped_at_utc, FALSE
+            FROM whitehouse_posts
+            WHERE NOT EXISTS (
+                SELECT 1 FROM posts WHERE posts.url = whitehouse_posts.url
+            )
+            ON CONFLICT (url) DO NOTHING;
+        """)
+        
     else:
         # SQLite schema
+        
+        # Legacy whitehouse_posts table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS whitehouse_posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,6 +203,19 @@ def run_migrations(db_path: Optional[str] = None) -> None:
                 title TEXT,
                 content TEXT,
                 scraped_at_utc INTEGER NOT NULL
+            );
+        """)
+        
+        # NEW: Unified posts table for all sources
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                url TEXT UNIQUE NOT NULL,
+                title TEXT,
+                content TEXT,
+                scraped_at_utc INTEGER NOT NULL,
+                is_retruth INTEGER DEFAULT 0
             );
         """)
 
@@ -163,8 +228,7 @@ def run_migrations(db_path: Optional[str] = None) -> None:
                 market_json TEXT,
                 tickers_json TEXT,
                 top_vertical TEXT,
-                top_vertical_conf REAL,
-                FOREIGN KEY (post_id) REFERENCES whitehouse_posts(id)
+                top_vertical_conf REAL
             );
         """)
 
@@ -172,6 +236,16 @@ def run_migrations(db_path: Optional[str] = None) -> None:
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_whitehouse_posts_scraped_at
             ON whitehouse_posts(scraped_at_utc DESC);
+        """)
+        
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_posts_scraped_at
+            ON posts(scraped_at_utc DESC);
+        """)
+        
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_posts_source
+            ON posts(source);
         """)
 
         cur.execute("""
@@ -182,6 +256,14 @@ def run_migrations(db_path: Optional[str] = None) -> None:
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_analyses_relevance
             ON analyses(relevance_score DESC, top_vertical_conf DESC);
+        """)
+        
+        # Migrate data from whitehouse_posts to posts if not already done
+        cur.execute("""
+            INSERT OR IGNORE INTO posts (source, url, title, content, scraped_at_utc, is_retruth)
+            SELECT 'whitehouse', url, title, content, scraped_at_utc, 0
+            FROM whitehouse_posts
+            WHERE url NOT IN (SELECT url FROM posts);
         """)
 
     conn.commit()
@@ -213,7 +295,210 @@ def check_db_connection() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# whitehouse_posts helpers
+# UNIFIED posts table helpers (NEW)
+# ---------------------------------------------------------------------------
+
+def insert_post(
+    source: str,
+    url: str,
+    title: Optional[str] = None,
+    content: Optional[str] = None,
+    scraped_at_utc: Optional[int] = None,
+    is_retruth: bool = False,
+    db_path: Optional[str] = None,
+) -> int:
+    """
+    Insert a new post into the unified posts table. Returns the inserted row id.
+    
+    Args:
+        source: Source of the post (e.g., 'whitehouse', 'truthsocial')
+        url: Unique URL of the post
+        title: Optional title
+        content: Optional content text
+        scraped_at_utc: Unix timestamp (defaults to now)
+        is_retruth: Whether this is a retruth/repost (for Truth Social)
+        db_path: Optional database path (SQLite only)
+    
+    If a post with the same URL already exists, returns the existing row id.
+    """
+    if scraped_at_utc is None:
+        scraped_at_utc = int(time.time())
+
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+    ph = _get_placeholder()
+    
+    # Convert bool to int for SQLite
+    is_retruth_val = is_retruth if USE_POSTGRES else int(is_retruth)
+
+    try:
+        if USE_POSTGRES:
+            cur.execute(
+                f"""
+                INSERT INTO posts (source, url, title, content, scraped_at_utc, is_retruth)
+                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                ON CONFLICT (url) DO NOTHING
+                RETURNING id
+                """,
+                (source, url, title, content, scraped_at_utc, is_retruth_val),
+            )
+            result = cur.fetchone()
+            if result:
+                row_id = result["id"]
+            else:
+                # URL already exists, fetch existing id
+                cur.execute(f"SELECT id FROM posts WHERE url = {ph}", (url,))
+                row = cur.fetchone()
+                row_id = row["id"] if row else -1
+        else:
+            # SQLite
+            try:
+                cur.execute(
+                    f"""
+                    INSERT INTO posts (source, url, title, content, scraped_at_utc, is_retruth)
+                    VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                    """,
+                    (source, url, title, content, scraped_at_utc, is_retruth_val),
+                )
+                row_id = cur.lastrowid
+            except sqlite3.IntegrityError:
+                # URL already exists, fetch existing id
+                cur.execute(f"SELECT id FROM posts WHERE url = {ph}", (url,))
+                row = cur.fetchone()
+                row_id = row["id"] if row else -1
+        
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    return row_id
+
+
+def get_post_by_url(
+    url: str,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Get a post by its URL from the unified posts table.
+    """
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+    ph = _get_placeholder()
+
+    cur.execute(
+        f"""
+        SELECT id, source, url, title, content, scraped_at_utc, is_retruth
+        FROM posts
+        WHERE url = {ph}
+        """,
+        (url,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    return _row_to_dict(row)
+
+
+def get_post_by_id(
+    post_id: int,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Get a post by its ID from the unified posts table.
+    """
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+    ph = _get_placeholder()
+
+    cur.execute(
+        f"""
+        SELECT id, source, url, title, content, scraped_at_utc, is_retruth
+        FROM posts
+        WHERE id = {ph}
+        """,
+        (post_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    return _row_to_dict(row)
+
+
+def get_latest_post(
+    source: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Get the most recently scraped post.
+    
+    Args:
+        source: Optional filter by source (e.g., 'whitehouse', 'truthsocial')
+        db_path: Optional database path (SQLite only)
+    """
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+    ph = _get_placeholder()
+
+    if source:
+        cur.execute(
+            f"""
+            SELECT id, source, url, title, content, scraped_at_utc, is_retruth
+            FROM posts
+            WHERE source = {ph}
+            ORDER BY scraped_at_utc DESC
+            LIMIT 1
+            """,
+            (source,),
+        )
+    else:
+        cur.execute("""
+            SELECT id, source, url, title, content, scraped_at_utc, is_retruth
+            FROM posts
+            ORDER BY scraped_at_utc DESC
+            LIMIT 1
+        """)
+    
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    return _row_to_dict(row)
+
+
+def get_posts_by_source(
+    source: str,
+    limit: int = 20,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Get posts filtered by source, ordered by most recent first.
+    """
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+    ph = _get_placeholder()
+
+    cur.execute(
+        f"""
+        SELECT id, source, url, title, content, scraped_at_utc, is_retruth
+        FROM posts
+        WHERE source = {ph}
+        ORDER BY scraped_at_utc DESC
+        LIMIT {ph}
+        """,
+        (source, limit),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Legacy whitehouse_posts helpers (kept for backward compatibility)
 # ---------------------------------------------------------------------------
 
 def insert_whitehouse_post(
@@ -226,79 +511,26 @@ def insert_whitehouse_post(
     """
     Insert a new whitehouse post. Returns the inserted row id.
     
-    If a post with the same URL already exists, returns the existing row id.
+    NOTE: This now inserts into the unified 'posts' table with source='whitehouse'.
+    The legacy whitehouse_posts table is kept for backward compatibility.
     """
-    if scraped_at_utc is None:
-        scraped_at_utc = int(time.time())
-
-    conn = get_connection(db_path)
-    cur = conn.cursor()
-    ph = _get_placeholder()
-
-    try:
-        if USE_POSTGRES:
-            # PostgreSQL with ON CONFLICT
-            cur.execute(
-                f"""
-                INSERT INTO whitehouse_posts (url, title, content, scraped_at_utc)
-                VALUES ({ph}, {ph}, {ph}, {ph})
-                ON CONFLICT (url) DO NOTHING
-                RETURNING id
-                """,
-                (url, title, content, scraped_at_utc),
-            )
-            result = cur.fetchone()
-            if result:
-                row_id = result["id"]
-            else:
-                # URL already exists, fetch existing id
-                cur.execute(f"SELECT id FROM whitehouse_posts WHERE url = {ph}", (url,))
-                row = cur.fetchone()
-                row_id = row["id"] if row else -1
-        else:
-            # SQLite
-            try:
-                cur.execute(
-                    f"""
-                    INSERT INTO whitehouse_posts (url, title, content, scraped_at_utc)
-                    VALUES ({ph}, {ph}, {ph}, {ph})
-                    """,
-                    (url, title, content, scraped_at_utc),
-                )
-                row_id = cur.lastrowid
-            except sqlite3.IntegrityError:
-                # URL already exists, fetch existing id
-                cur.execute(f"SELECT id FROM whitehouse_posts WHERE url = {ph}", (url,))
-                row = cur.fetchone()
-                row_id = row["id"] if row else -1
-        
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
-
-    return row_id
+    # Insert into unified posts table
+    return insert_post(
+        source=SOURCE_WHITEHOUSE,
+        url=url,
+        title=title,
+        content=content,
+        scraped_at_utc=scraped_at_utc,
+        is_retruth=False,
+        db_path=db_path,
+    )
 
 
 def get_latest_whitehouse_post(db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     Get the most recently scraped whitehouse post.
-    Returns a dict with keys: id, url, title, content, scraped_at_utc
     """
-    conn = get_connection(db_path)
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT id, url, title, content, scraped_at_utc
-        FROM whitehouse_posts
-        ORDER BY scraped_at_utc DESC
-        LIMIT 1
-    """)
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    return _row_to_dict(row)
+    return get_latest_post(source=SOURCE_WHITEHOUSE, db_path=db_path)
 
 
 def get_whitehouse_post_by_id(
@@ -308,23 +540,10 @@ def get_whitehouse_post_by_id(
     """
     Get a whitehouse post by its id.
     """
-    conn = get_connection(db_path)
-    cur = conn.cursor()
-    ph = _get_placeholder()
-
-    cur.execute(
-        f"""
-        SELECT id, url, title, content, scraped_at_utc
-        FROM whitehouse_posts
-        WHERE id = {ph}
-        """,
-        (post_id,),
-    )
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    return _row_to_dict(row)
+    post = get_post_by_id(post_id, db_path)
+    if post and post.get("source") == SOURCE_WHITEHOUSE:
+        return post
+    return None
 
 
 def get_whitehouse_post_by_url(
@@ -334,23 +553,56 @@ def get_whitehouse_post_by_url(
     """
     Get a whitehouse post by its URL.
     """
-    conn = get_connection(db_path)
-    cur = conn.cursor()
-    ph = _get_placeholder()
+    post = get_post_by_url(url, db_path)
+    if post and post.get("source") == SOURCE_WHITEHOUSE:
+        return post
+    return None
 
-    cur.execute(
-        f"""
-        SELECT id, url, title, content, scraped_at_utc
-        FROM whitehouse_posts
-        WHERE url = {ph}
-        """,
-        (url,),
+
+# ---------------------------------------------------------------------------
+# Truth Social posts helpers (NEW)
+# ---------------------------------------------------------------------------
+
+def insert_truthsocial_post(
+    url: str,
+    content: str,
+    is_retruth: bool = False,
+    title: Optional[str] = None,
+    scraped_at_utc: Optional[int] = None,
+    db_path: Optional[str] = None,
+) -> int:
+    """
+    Insert a new Truth Social post. Returns the inserted row id.
+    """
+    return insert_post(
+        source=SOURCE_TRUTHSOCIAL,
+        url=url,
+        title=title,
+        content=content,
+        scraped_at_utc=scraped_at_utc,
+        is_retruth=is_retruth,
+        db_path=db_path,
     )
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
 
-    return _row_to_dict(row)
+
+def get_latest_truthsocial_post(db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Get the most recently scraped Truth Social post.
+    """
+    return get_latest_post(source=SOURCE_TRUTHSOCIAL, db_path=db_path)
+
+
+def get_truthsocial_post_by_url(
+    url: str,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Get a Truth Social post by its URL.
+    """
+    post = get_post_by_url(url, db_path)
+    if post and post.get("source") == SOURCE_TRUTHSOCIAL:
+        return post
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +700,7 @@ def persist_analysis(
     - Full market_json stored as TEXT
     
     Args:
-        post_id: ID of the whitehouse_post this analysis is for
+        post_id: ID of the post this analysis is for
         market_json: The market impact analysis dict from analyzer
         db_path: Optional path to database
     

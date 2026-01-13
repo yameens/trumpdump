@@ -154,6 +154,33 @@ def run_migrations(db_path: Optional[str] = None) -> None:
                 top_vertical_conf REAL
             );
         """)
+        
+        # FIX: Drop old foreign key constraint that references whitehouse_posts
+        # and add new constraint that references unified posts table
+        cur.execute("""
+            DO $$
+            BEGIN
+                -- Drop old constraint if it exists (references whitehouse_posts)
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints 
+                    WHERE constraint_name = 'analyses_post_id_fkey' 
+                    AND table_name = 'analyses'
+                ) THEN
+                    ALTER TABLE analyses DROP CONSTRAINT analyses_post_id_fkey;
+                END IF;
+                
+                -- Add new constraint referencing posts table (if not exists)
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints 
+                    WHERE constraint_name = 'analyses_post_id_posts_fkey' 
+                    AND table_name = 'analyses'
+                ) THEN
+                    ALTER TABLE analyses 
+                    ADD CONSTRAINT analyses_post_id_posts_fkey 
+                    FOREIGN KEY (post_id) REFERENCES posts(id);
+                END IF;
+            END $$;
+        """)
 
         # Create indexes
         cur.execute("""
